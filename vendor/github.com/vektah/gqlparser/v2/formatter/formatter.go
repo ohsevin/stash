@@ -15,15 +15,49 @@ type Formatter interface {
 	FormatQueryDocument(doc *ast.QueryDocument)
 }
 
-func NewFormatter(w io.Writer) Formatter {
-	return &formatter{writer: w}
+//nolint:revive // Ignore "stuttering" name format.FormatterOption
+type FormatterOption func(*formatter)
+
+// WithIndent uses the given string for indenting block bodies in the output,
+// instead of the default, `"\t"`.
+func WithIndent(indent string) FormatterOption {
+	return func(f *formatter) {
+		f.indent = indent
+	}
+}
+
+// WithComments includes comments from the source/AST in the formatted output.
+func WithComments() FormatterOption {
+	return func(f *formatter) {
+		f.emitComments = true
+	}
+}
+
+// WithBuiltin includes builtin fields/directives/etc from the source/AST in the formatted output.
+func WithBuiltin() FormatterOption {
+	return func(f *formatter) {
+		f.emitBuiltin = true
+	}
+}
+
+func NewFormatter(w io.Writer, options ...FormatterOption) Formatter {
+	f := &formatter{
+		indent: "\t",
+		writer: w,
+	}
+	for _, opt := range options {
+		opt(f)
+	}
+	return f
 }
 
 type formatter struct {
 	writer io.Writer
 
-	indent      int
-	emitBuiltin bool
+	indent       string
+	indentSize   int
+	emitBuiltin  bool
+	emitComments bool
 
 	padNext  bool
 	lineHead bool
@@ -35,7 +69,7 @@ func (f *formatter) writeString(s string) {
 
 func (f *formatter) writeIndent() *formatter {
 	if f.lineHead {
-		f.writeString(strings.Repeat("\t", f.indent))
+		f.writeString(strings.Repeat(f.indent, f.indentSize))
 	}
 	f.lineHead = false
 	f.padNext = false
@@ -82,9 +116,9 @@ func (f *formatter) WriteDescription(s string) *formatter {
 		return f
 	}
 
-	f.WriteString(`"""`).WriteNewline()
-
+	f.WriteString(`"""`)
 	ss := strings.Split(s, "\n")
+	f.WriteNewline()
 	for _, s := range ss {
 		f.WriteString(s).WriteNewline()
 	}
@@ -95,11 +129,11 @@ func (f *formatter) WriteDescription(s string) *formatter {
 }
 
 func (f *formatter) IncrementIndent() {
-	f.indent++
+	f.indentSize++
 }
 
 func (f *formatter) DecrementIndent() {
-	f.indent--
+	f.indentSize--
 }
 
 func (f *formatter) NoPadding() *formatter {
@@ -118,6 +152,8 @@ func (f *formatter) FormatSchema(schema *ast.Schema) {
 	if schema == nil {
 		return
 	}
+
+	f.FormatCommentGroup(schema.Comment)
 
 	var inSchema bool
 	startSchema := func() {
@@ -181,6 +217,9 @@ func (f *formatter) FormatSchemaDocument(doc *ast.SchemaDocument) {
 
 	f.FormatDefinitionList(doc.Definitions, false)
 	f.FormatDefinitionList(doc.Extensions, true)
+
+	// doc.Comment is end of file comment, so emit last
+	f.FormatCommentGroup(doc.Comment)
 }
 
 func (f *formatter) FormatQueryDocument(doc *ast.QueryDocument) {
@@ -190,6 +229,8 @@ func (f *formatter) FormatQueryDocument(doc *ast.QueryDocument) {
 		return
 	}
 
+	f.FormatCommentGroup(doc.Comment)
+
 	f.FormatOperationList(doc.Operations)
 	f.FormatFragmentDefinitionList(doc.Fragments)
 }
@@ -198,6 +239,30 @@ func (f *formatter) FormatSchemaDefinitionList(lists ast.SchemaDefinitionList, e
 	if len(lists) == 0 {
 		return
 	}
+
+	var (
+		beforeDescComment      = new(ast.CommentGroup)
+		afterDescComment       = new(ast.CommentGroup)
+		endOfDefinitionComment = new(ast.CommentGroup)
+		description            string
+	)
+
+	for _, def := range lists {
+		if def.BeforeDescriptionComment != nil {
+			beforeDescComment.List = append(beforeDescComment.List, def.BeforeDescriptionComment.List...)
+		}
+		if def.AfterDescriptionComment != nil {
+			afterDescComment.List = append(afterDescComment.List, def.AfterDescriptionComment.List...)
+		}
+		if def.EndOfDefinitionComment != nil {
+			endOfDefinitionComment.List = append(endOfDefinitionComment.List, def.EndOfDefinitionComment.List...)
+		}
+		description += def.Description
+	}
+
+	f.FormatCommentGroup(beforeDescComment)
+	f.WriteDescription(description)
+	f.FormatCommentGroup(afterDescComment)
 
 	if extension {
 		f.WriteWord("extend")
@@ -209,13 +274,13 @@ func (f *formatter) FormatSchemaDefinitionList(lists ast.SchemaDefinitionList, e
 		f.FormatSchemaDefinition(def)
 	}
 
+	f.FormatCommentGroup(endOfDefinitionComment)
+
 	f.DecrementIndent()
 	f.WriteString("}").WriteNewline()
 }
 
 func (f *formatter) FormatSchemaDefinition(def *ast.SchemaDefinition) {
-	f.WriteDescription(def.Description)
-
 	f.FormatDirectiveList(def.Directives)
 
 	f.FormatOperationTypeDefinitionList(def.OperationTypes)
@@ -228,12 +293,13 @@ func (f *formatter) FormatOperationTypeDefinitionList(lists ast.OperationTypeDef
 }
 
 func (f *formatter) FormatOperationTypeDefinition(def *ast.OperationTypeDefinition) {
+	f.FormatCommentGroup(def.Comment)
 	f.WriteWord(string(def.Operation)).NoPadding().WriteString(":").NeedPadding()
 	f.WriteWord(def.Type)
 	f.WriteNewline()
 }
 
-func (f *formatter) FormatFieldList(fieldList ast.FieldList) {
+func (f *formatter) FormatFieldList(fieldList ast.FieldList, endOfDefComment *ast.CommentGroup) {
 	if len(fieldList) == 0 {
 		return
 	}
@@ -245,6 +311,8 @@ func (f *formatter) FormatFieldList(fieldList ast.FieldList) {
 		f.FormatFieldDefinition(field)
 	}
 
+	f.FormatCommentGroup(endOfDefComment)
+
 	f.DecrementIndent()
 	f.WriteString("}")
 }
@@ -254,7 +322,11 @@ func (f *formatter) FormatFieldDefinition(field *ast.FieldDefinition) {
 		return
 	}
 
+	f.FormatCommentGroup(field.BeforeDescriptionComment)
+
 	f.WriteDescription(field.Description)
+
+	f.FormatCommentGroup(field.AfterDescriptionComment)
 
 	f.WriteWord(field.Name).NoPadding()
 	f.FormatArgumentDefinitionList(field.Arguments)
@@ -280,7 +352,9 @@ func (f *formatter) FormatArgumentDefinitionList(lists ast.ArgumentDefinitionLis
 	for idx, arg := range lists {
 		f.FormatArgumentDefinition(arg)
 
-		if idx != len(lists)-1 {
+		// Skip emitting (insignificant) comma in case it is the
+		// last argument, or we printed a new line in its definition.
+		if idx != len(lists)-1 && arg.Description == "" {
 			f.NoPadding().WriteWord(",")
 		}
 	}
@@ -288,10 +362,14 @@ func (f *formatter) FormatArgumentDefinitionList(lists ast.ArgumentDefinitionLis
 }
 
 func (f *formatter) FormatArgumentDefinition(def *ast.ArgumentDefinition) {
+	f.FormatCommentGroup(def.BeforeDescriptionComment)
+
 	if def.Description != "" {
 		f.WriteNewline().IncrementIndent()
 		f.WriteDescription(def.Description)
 	}
+
+	f.FormatCommentGroup(def.AfterDescriptionComment)
 
 	f.WriteWord(def.Name).NoPadding().WriteString(":").NeedPadding()
 	f.FormatType(def.Type)
@@ -300,6 +378,8 @@ func (f *formatter) FormatArgumentDefinition(def *ast.ArgumentDefinition) {
 		f.WriteWord("=")
 		f.FormatValue(def.DefaultValue)
 	}
+
+	f.NeedPadding().FormatDirectiveList(def.Directives)
 
 	if def.Description != "" {
 		f.DecrementIndent()
@@ -328,12 +408,21 @@ func (f *formatter) FormatDirectiveDefinition(def *ast.DirectiveDefinition) {
 		}
 	}
 
+	f.FormatCommentGroup(def.BeforeDescriptionComment)
+
 	f.WriteDescription(def.Description)
+
+	f.FormatCommentGroup(def.AfterDescriptionComment)
+
 	f.WriteWord("directive").WriteString("@").WriteWord(def.Name)
 
 	if len(def.Arguments) != 0 {
 		f.NoPadding()
 		f.FormatArgumentDefinitionList(def.Arguments)
+	}
+
+	if def.IsRepeatable {
+		f.WriteWord("repeatable")
 	}
 
 	if len(def.Locations) != 0 {
@@ -366,7 +455,11 @@ func (f *formatter) FormatDefinition(def *ast.Definition, extend bool) {
 		return
 	}
 
+	f.FormatCommentGroup(def.BeforeDescriptionComment)
+
 	f.WriteDescription(def.Description)
+
+	f.FormatCommentGroup(def.AfterDescriptionComment)
 
 	if extend {
 		f.WriteWord("extend")
@@ -402,14 +495,14 @@ func (f *formatter) FormatDefinition(def *ast.Definition, extend bool) {
 		f.WriteWord("=").WriteWord(strings.Join(def.Types, " | "))
 	}
 
-	f.FormatFieldList(def.Fields)
+	f.FormatFieldList(def.Fields, def.EndOfDefinitionComment)
 
-	f.FormatEnumValueList(def.EnumValues)
+	f.FormatEnumValueList(def.EnumValues, def.EndOfDefinitionComment)
 
 	f.WriteNewline()
 }
 
-func (f *formatter) FormatEnumValueList(lists ast.EnumValueList) {
+func (f *formatter) FormatEnumValueList(lists ast.EnumValueList, endOfDefComment *ast.CommentGroup) {
 	if len(lists) == 0 {
 		return
 	}
@@ -421,12 +514,18 @@ func (f *formatter) FormatEnumValueList(lists ast.EnumValueList) {
 		f.FormatEnumValueDefinition(v)
 	}
 
+	f.FormatCommentGroup(endOfDefComment)
+
 	f.DecrementIndent()
 	f.WriteString("}")
 }
 
 func (f *formatter) FormatEnumValueDefinition(def *ast.EnumValueDefinition) {
+	f.FormatCommentGroup(def.BeforeDescriptionComment)
+
 	f.WriteDescription(def.Description)
+
+	f.FormatCommentGroup(def.AfterDescriptionComment)
 
 	f.WriteWord(def.Name)
 	f.FormatDirectiveList(def.Directives)
@@ -441,6 +540,8 @@ func (f *formatter) FormatOperationList(lists ast.OperationList) {
 }
 
 func (f *formatter) FormatOperationDefinition(def *ast.OperationDefinition) {
+	f.FormatCommentGroup(def.Comment)
+
 	f.WriteWord(string(def.Operation))
 	if def.Name != "" {
 		f.WriteWord(def.Name)
@@ -485,6 +586,8 @@ func (f *formatter) FormatArgumentList(lists ast.ArgumentList) {
 }
 
 func (f *formatter) FormatArgument(arg *ast.Argument) {
+	f.FormatCommentGroup(arg.Comment)
+
 	f.WriteWord(arg.Name).NoPadding().WriteString(":").NeedPadding()
 	f.WriteString(arg.Value.String())
 }
@@ -496,6 +599,8 @@ func (f *formatter) FormatFragmentDefinitionList(lists ast.FragmentDefinitionLis
 }
 
 func (f *formatter) FormatFragmentDefinition(def *ast.FragmentDefinition) {
+	f.FormatCommentGroup(def.Comment)
+
 	f.WriteWord("fragment").WriteWord(def.Name)
 	f.FormatVariableDefinitionList(def.VariableDefinition)
 	f.WriteWord("on").WriteWord(def.TypeCondition)
@@ -524,6 +629,8 @@ func (f *formatter) FormatVariableDefinitionList(lists ast.VariableDefinitionLis
 }
 
 func (f *formatter) FormatVariableDefinition(def *ast.VariableDefinition) {
+	f.FormatCommentGroup(def.Comment)
+
 	f.WriteString("$").WriteWord(def.Variable).NoPadding().WriteString(":").NeedPadding()
 	f.FormatType(def.Type)
 
@@ -571,6 +678,8 @@ func (f *formatter) FormatSelection(selection ast.Selection) {
 }
 
 func (f *formatter) FormatField(field *ast.Field) {
+	f.FormatCommentGroup(field.Comment)
+
 	if field.Alias != "" && field.Alias != field.Name {
 		f.WriteWord(field.Alias).NoPadding().WriteString(":").NeedPadding()
 	}
@@ -588,12 +697,16 @@ func (f *formatter) FormatField(field *ast.Field) {
 }
 
 func (f *formatter) FormatFragmentSpread(spread *ast.FragmentSpread) {
+	f.FormatCommentGroup(spread.Comment)
+
 	f.WriteWord("...").WriteWord(spread.Name)
 
 	f.FormatDirectiveList(spread.Directives)
 }
 
 func (f *formatter) FormatInlineFragment(inline *ast.InlineFragment) {
+	f.FormatCommentGroup(inline.Comment)
+
 	f.WriteWord("...")
 	if inline.TypeCondition != "" {
 		f.WriteWord("on").WriteWord(inline.TypeCondition)
@@ -609,5 +722,23 @@ func (f *formatter) FormatType(t *ast.Type) {
 }
 
 func (f *formatter) FormatValue(value *ast.Value) {
+	f.FormatCommentGroup(value.Comment)
+
 	f.WriteString(value.String())
+}
+
+func (f *formatter) FormatCommentGroup(group *ast.CommentGroup) {
+	if !f.emitComments || group == nil {
+		return
+	}
+	for _, comment := range group.List {
+		f.FormatComment(comment)
+	}
+}
+
+func (f *formatter) FormatComment(comment *ast.Comment) {
+	if !f.emitComments || comment == nil {
+		return
+	}
+	f.WriteString("#").WriteString(comment.Text()).WriteNewline()
 }
