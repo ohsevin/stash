@@ -6,6 +6,8 @@ import (
 	"strconv"
 
 	"github.com/vektah/gqlparser/v2/ast"
+
+	//nolint:revive // Validator rules each use dot imports for convenience.
 	. "github.com/vektah/gqlparser/v2/validator"
 )
 
@@ -14,6 +16,13 @@ func init() {
 		observers.OnValue(func(walker *Walker, value *ast.Value) {
 			if value.Definition == nil || value.ExpectedType == nil {
 				return
+			}
+
+			if value.Kind == ast.NullValue && value.ExpectedType.NonNull {
+				addError(
+					Message(`Expected value of type "%s", found %s.`, value.ExpectedType.String(), value.String()),
+					At(value.Position),
+				)
 			}
 
 			if value.Definition.Kind == ast.Scalar {
@@ -37,13 +46,7 @@ func init() {
 
 			switch value.Kind {
 			case ast.NullValue:
-				if value.ExpectedType.NonNull {
-					addError(
-						Message(`Expected value of type "%s", found %s.`, value.ExpectedType.String(), value.String()),
-						At(value.Position),
-					)
-				}
-
+				return
 			case ast.ListValue:
 				if value.ExpectedType.Elem == nil {
 					unexpectedTypeMessage(addError, value)
@@ -156,7 +159,7 @@ func unexpectedTypeMessageOnly(v *ast.Value) ErrorOption {
 		return Message(`Float cannot represent non numeric value: %s`, v.String())
 	case "ID", "ID!":
 		return Message(`ID cannot represent a non-string and non-integer value: %s`, v.String())
-	//case "Enum":
+	// case "Enum":
 	//		return Message(`Enum "%s" cannot represent non-enum value: %s`, v.ExpectedType.String(), v.String())
 	default:
 		if v.Definition.Kind == ast.Enum {
